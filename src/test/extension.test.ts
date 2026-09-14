@@ -12,6 +12,7 @@ import {
   buildActivitiesListEndpoint,
   buildSessionsListEndpoint,
   mergeActivitiesByIdentity,
+  fetchSessionActivitiesPaginated,
   getLatestActivityCreateTime,
   getSourceDisplayName,
   getSourceIsPrivate,
@@ -20,11 +21,15 @@ import {
   Session,
   SessionOutput,
   createRemoteBranch,
+  resetUpdatePreviousStatesCachesForTests,
+  setPRStatusCacheForTests,
+  JulesSessionsProvider,
 } from "../extension";
 import { buildFinalPrompt } from "../promptUtils";
 import { updateSessionArtifactsCache } from "../sessionArtifacts";
 import * as sinon from "sinon";
 import * as fetchUtils from "../fetchUtils";
+import { GitHubAuth } from "../githubAuth";
 import { activate } from "../extension";
 
 suite("Extension Test Suite", () => {
@@ -389,9 +394,6 @@ suite("Extension Test Suite", () => {
           if (key === "customPrompt") {
             return "My custom prompt";
           }
-          if (key === "enforceJapanese") {
-            return true;
-          }
           return undefined;
         }),
       };
@@ -399,7 +401,7 @@ suite("Extension Test Suite", () => {
 
       const userPrompt = "User message";
       const finalPrompt = buildFinalPrompt(userPrompt);
-      assert.strictEqual(finalPrompt, "My custom prompt\n\nUser message\n\nPlease use Japanese for all GitHub interactions (PR titles, descriptions, commit messages, and review replies).");
+      assert.strictEqual(finalPrompt, "My custom prompt\n\nUser message");
     });
 
     test("should return only user prompt if custom prompt is empty", () => {
@@ -407,47 +409,6 @@ suite("Extension Test Suite", () => {
         get: sinon.stub().callsFake((key: string) => {
           if (key === "customPrompt") {
             return "";
-          }
-          if (key === "enforceJapanese") {
-            return true;
-          }
-          return undefined;
-        }),
-      };
-      getConfigurationStub.withArgs("jules-extension").returns(workspaceConfig as any);
-
-      const userPrompt = "User message";
-      const finalPrompt = buildFinalPrompt(userPrompt);
-      assert.strictEqual(finalPrompt, "User message\n\nPlease use Japanese for all GitHub interactions (PR titles, descriptions, commit messages, and review replies).");
-    });
-
-    test("should return only user prompt if custom prompt is not set", () => {
-      const workspaceConfig = {
-        get: sinon.stub().callsFake((key: string) => {
-          if (key === "customPrompt") {
-            return undefined;
-          }
-          if (key === "enforceJapanese") {
-            return true;
-          }
-          return undefined;
-        }),
-      };
-      getConfigurationStub.withArgs("jules-extension").returns(workspaceConfig as any);
-
-      const userPrompt = "User message";
-      const finalPrompt = buildFinalPrompt(userPrompt);
-      assert.strictEqual(finalPrompt, "User message\n\nPlease use Japanese for all GitHub interactions (PR titles, descriptions, commit messages, and review replies).");
-    });
-
-    test("should not append Japanese instruction when enforceJapanese is false", () => {
-      const workspaceConfig = {
-        get: sinon.stub().callsFake((key: string) => {
-          if (key === "customPrompt") {
-            return "";
-          }
-          if (key === "enforceJapanese") {
-            return false;
           }
           return undefined;
         }),
@@ -459,14 +420,11 @@ suite("Extension Test Suite", () => {
       assert.strictEqual(finalPrompt, "User message");
     });
 
-    test("should not append Japanese instruction when enforceJapanese is false even with custom prompt", () => {
+    test("should return only user prompt if custom prompt is not set", () => {
       const workspaceConfig = {
         get: sinon.stub().callsFake((key: string) => {
           if (key === "customPrompt") {
-            return "Custom instructions";
-          }
-          if (key === "enforceJapanese") {
-            return false;
+            return undefined;
           }
           return undefined;
         }),
@@ -475,7 +433,7 @@ suite("Extension Test Suite", () => {
 
       const userPrompt = "User message";
       const finalPrompt = buildFinalPrompt(userPrompt);
-      assert.strictEqual(finalPrompt, "Custom instructions\n\nUser message");
+      assert.strictEqual(finalPrompt, "User message");
     });
   });
 
@@ -599,6 +557,156 @@ suite("Extension Test Suite", () => {
       localSandbox.restore();
     });
   });
+  suite("Proxy detection", () => {
+    const proxyEnvKeys = [
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "http_proxy",
+      "https_proxy",
+      "ALL_PROXY",
+      "all_proxy",
+    ] as const;
+
+    let localSandbox: sinon.SinonSandbox;
+    let savedEnv: Partial<Record<(typeof proxyEnvKeys)[number], string | undefined>>;
+
+    const createProxyActivationContext = (): vscode.ExtensionContext => ({
+      globalState: {
+        get: localSandbox.stub().returns({}),
+        update: localSandbox.stub().resolves(),
+        keys: localSandbox.stub().returns([]),
+      },
+      subscriptions: [],
+      extensionUri: vscode.Uri.file("/tmp/jules-extension"),
+      extensionPath: "/tmp/jules-extension",
+      workspaceState: {
+        get: localSandbox.stub(),
+        update: localSandbox.stub().resolves(),
+        keys: localSandbox.stub().returns([]),
+      } as any,
+      environmentVariableCollection: {
+        get: localSandbox.stub(),
+        replace: localSandbox.stub(),
+        append: localSandbox.stub(),
+        prepend: localSandbox.stub(),
+        delete: localSandbox.stub(),
+        clear: localSandbox.stub(),
+        forEach: localSandbox.stub(),
+        persistent: false,
+        description: undefined,
+        __brand: undefined,
+      } as any,
+      logUri: vscode.Uri.file("/tmp/jules-extension.log"),
+      storageUri: vscode.Uri.file("/tmp/jules-extension-storage"),
+      storagePath: "/tmp/jules-extension-storage",
+      secrets: { get: localSandbox.stub().resolves(undefined), store: localSandbox.stub().resolves() },
+      asAbsolutePath: (relativePath: string) => `/tmp/jules-extension/${relativePath}`,
+    } as any as vscode.ExtensionContext);
+
+    setup(() => {
+      localSandbox = sinon.createSandbox();
+      savedEnv = {};
+
+      for (const key of proxyEnvKeys) {
+        savedEnv[key] = process.env[key];
+        delete process.env[key];
+      }
+
+      const originalGetConfiguration = vscode.workspace.getConfiguration.bind(vscode.workspace);
+      localSandbox.stub(vscode.workspace, "getConfiguration").callsFake((section?: string) => {
+        if (section === "http") {
+          return {
+            get: () => undefined,
+          } as any;
+        }
+
+        return originalGetConfiguration(section as any);
+      });
+
+      localSandbox.stub(vscode.window, "createTreeView").callsFake(() => ({
+        onDidChangeSelection: () => ({ dispose: () => { } }),
+        dispose: () => { },
+      } as any));
+      localSandbox.stub(vscode.window, "registerWebviewViewProvider").callsFake(() => ({ dispose: () => { } } as any));
+      localSandbox.stub(vscode.window, "createStatusBarItem").returns({
+        show: () => { },
+        hide: () => { },
+        dispose: () => { },
+        name: "",
+      } as any);
+      localSandbox.stub(vscode.window, "createOutputChannel").returns({
+        appendLine: () => { },
+        clear: () => { },
+        show: () => { },
+        hide: () => { },
+        dispose: () => { },
+      } as any);
+      localSandbox.stub(vscode.languages, "registerCodeActionsProvider").callsFake(() => ({ dispose: () => { } } as any));
+      localSandbox.stub(vscode.languages, "registerCodeLensProvider").callsFake(() => ({ dispose: () => { } } as any));
+      localSandbox.stub(vscode.workspace, "registerTextDocumentContentProvider").callsFake(() => ({ dispose: () => { } } as any));
+      localSandbox.stub(vscode.workspace, "onDidChangeConfiguration").callsFake(() => ({ dispose: () => { } } as any));
+      localSandbox.stub(vscode.commands, "registerCommand").callsFake(() => ({ dispose: () => { } } as any));
+      localSandbox.stub(vscode.commands, "executeCommand").resolves();
+      localSandbox.stub(fetchUtils, "setHttpProxy").callsFake(() => undefined);
+      localSandbox.stub(fetchUtils, "setSocksProxy").callsFake(() => undefined);
+      localSandbox.stub(fetchUtils, "fetchWithTimeout").resolves({ ok: true, json: async () => ({}) } as any);
+    });
+
+    teardown(() => {
+      for (const key of proxyEnvKeys) {
+        const value = savedEnv[key];
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+
+      localSandbox.restore();
+    });
+
+    test("should stop activation when proxy URL is invalid", () => {
+      process.env.HTTP_PROXY = "http://";
+      const errorStub = localSandbox.stub(console, "error");
+
+      const mockContext = createProxyActivationContext();
+      activate(mockContext);
+
+      assert.strictEqual((fetchUtils.setHttpProxy as sinon.SinonStub).called, false);
+      assert.strictEqual((fetchUtils.setSocksProxy as sinon.SinonStub).called, false);
+      if (errorStub.called) {
+        assert.ok(errorStub.args.some((args) => String(args[0]).includes("Invalid proxy URL")));
+      }
+    });
+
+    test("should configure HTTP proxy when HTTP_PROXY is set", () => {
+      process.env.HTTP_PROXY = "http://proxy.example.com:8080";
+      const infoStub = localSandbox.stub(vscode.window, "showInformationMessage");
+
+      const mockContext = createProxyActivationContext();
+      activate(mockContext);
+
+      assert.strictEqual((fetchUtils.setHttpProxy as sinon.SinonStub).calledOnce, true);
+      assert.deepStrictEqual((fetchUtils.setHttpProxy as sinon.SinonStub).firstCall.args, ["http://proxy.example.com:8080"]);
+      assert.strictEqual((fetchUtils.setSocksProxy as sinon.SinonStub).called, false);
+      assert.ok(infoStub.called);
+      assert.ok(infoStub.args.some((args) => String(args[0]).includes("HTTP/HTTPS proxy")));
+    });
+
+    test("should configure SOCKS proxy when ALL_PROXY is a socks URL", () => {
+      process.env.ALL_PROXY = "socks5://proxy.example.com:1080";
+      const infoStub = localSandbox.stub(vscode.window, "showInformationMessage");
+
+      const mockContext = createProxyActivationContext();
+      activate(mockContext);
+
+      assert.strictEqual((fetchUtils.setSocksProxy as sinon.SinonStub).calledOnce, true);
+      assert.deepStrictEqual((fetchUtils.setSocksProxy as sinon.SinonStub).firstCall.args, ["socks5://proxy.example.com:1080"]);
+      assert.strictEqual((fetchUtils.setHttpProxy as sinon.SinonStub).called, false);
+      assert.ok(infoStub.called);
+      assert.ok(infoStub.args.some((args) => String(args[0]).includes("SOCKS proxy")));
+    });
+  });
 
   // Integration tests for caching logic
   suite("Caching Integration Tests", () => {
@@ -715,7 +823,7 @@ suite("Extension Test Suite", () => {
       );
 
       assert.ok(url.includes("/sessions?"));
-      assert.ok(url.includes("pageSize=100"));
+      assert.ok(url.includes("pageSize=5000"));
       assert.ok(url.includes("pageToken=next-token-1"));
     });
 
@@ -729,7 +837,7 @@ suite("Extension Test Suite", () => {
       );
 
       assert.ok(url.includes("/sessions/123/activities?"));
-      assert.ok(url.includes("pageSize=100"));
+      assert.ok(url.includes("pageSize=5000"));
       assert.ok(url.includes("pageToken=p2"));
       assert.ok(!url.includes("createTime"), "createTime is not a valid API parameter");
     });
@@ -891,7 +999,7 @@ suite("Extension Test Suite", () => {
       assert.strictEqual(fetchStub.callCount, 2);
       assert.ok(String(fetchStub.getCall(0).args[0]).includes(`/${activeSessionId}`));
       assert.ok(
-        String(fetchStub.getCall(1).args[0]).includes(`/${activeSessionId}/activities?pageSize=100`),
+        String(fetchStub.getCall(1).args[0]).includes(`/${activeSessionId}/activities?pageSize=5000`),
       );
 
       assert.strictEqual(updateSessionStub.callCount, 1);
@@ -912,7 +1020,7 @@ suite("Extension Test Suite", () => {
       );
     });
 
-    test("should throw when active session fetch fails", async () => {
+    test("should throw when active session fetch fails (non-404)", async () => {
       const updateSessionStub = sandbox.stub();
       fetchStub.onFirstCall().resolves({
         ok: false,
@@ -1043,6 +1151,7 @@ suite("Extension Test Suite", () => {
 
     setup(() => {
       sandbox = sinon.createSandbox();
+      resetUpdatePreviousStatesCachesForTests();
       updateStub = sandbox.stub().resolves();
       mockContext = {
         globalState: {
@@ -1051,9 +1160,11 @@ suite("Extension Test Suite", () => {
           keys: sandbox.stub().returns([]),
         },
       } as any;
+      resetUpdatePreviousStatesCachesForTests();
     });
 
     teardown(() => {
+      resetUpdatePreviousStatesCachesForTests();
       sandbox.restore();
     });
 
@@ -1106,6 +1217,136 @@ suite("Extension Test Suite", () => {
         }
       }
       assert.ok(prCacheUpdateCalled, "Should have attempted to save PR status cache");
+    });
+
+    test("updatePreviousStates cache logic coverage", async () => {
+      const now = Date.now();
+      const prUrlValid = "https://github.com/owner/repo/pull/1";
+      const prUrlExpired = "https://github.com/owner/repo/pull/2";
+      const prUrlError = "https://github.com/owner/repo/pull/3";
+      const prUrlNew = "https://github.com/owner/repo/pull/4";
+
+      const initialCache = {
+        [prUrlValid]: { isClosed: false, lastChecked: now - 1000, isError: false },
+        [prUrlExpired]: { isClosed: false, lastChecked: now - 10 * 60 * 1000, isError: false },
+        [prUrlError]: { isClosed: false, lastChecked: now - 40 * 1000, isError: true },
+      };
+
+      setPRStatusCacheForTests(initialCache);
+
+      const sessions: Session[] = [
+        {
+          name: "s-valid",
+          title: "s-valid",
+          state: "COMPLETED",
+          rawState: "COMPLETED",
+          outputs: [{ pullRequest: { url: prUrlValid, title: "PR1", description: "" } }]
+        },
+        {
+          name: "s-expired",
+          title: "s-expired",
+          state: "COMPLETED",
+          rawState: "COMPLETED",
+          outputs: [{ pullRequest: { url: prUrlExpired, title: "PR2", description: "" } }]
+        },
+        {
+          name: "s-error",
+          title: "s-error",
+          state: "COMPLETED",
+          rawState: "COMPLETED",
+          outputs: [{ pullRequest: { url: prUrlError, title: "PR3", description: "" } }]
+        },
+        {
+          name: "s-new",
+          title: "s-new",
+          state: "COMPLETED",
+          rawState: "COMPLETED",
+          outputs: [{ pullRequest: { url: prUrlNew, title: "PR4", description: "" } }]
+        }
+      ];
+
+      const fetchStub = sandbox.stub(fetchUtils, "fetchWithTimeout").resolves({
+        ok: true,
+        json: async () => ({ state: "closed" })
+      } as any);
+
+      const getTokenStub = sandbox.stub(GitHubAuth, "getToken").resolves("dummy-token");
+
+      await updatePreviousStates(sessions, mockContext);
+
+      // getToken should be called because there are URLs to fetch (expired, error-expired, new)
+      assert.ok(getTokenStub.calledOnce);
+
+      // fetch should be called for expired, error-expired, and new
+      assert.strictEqual(fetchStub.callCount, 3);
+
+      const fetchedUrls = fetchStub.getCalls().map(c => c.args[0]);
+      assert.ok(fetchedUrls.some(u => (u as string).includes("pulls/2")));
+      assert.ok(fetchedUrls.some(u => (u as string).includes("pulls/3")));
+      assert.ok(fetchedUrls.some(u => (u as string).includes("pulls/4")));
+      assert.ok(!fetchedUrls.some(u => (u as string).includes("pulls/1")));
+    });
+    test("updatePreviousStates should not fetch token if everything is cached and valid", async () => {
+      const now = Date.now();
+      const prUrl = "https://github.com/owner/repo/pull/1";
+      const prUrlErrorValid = "https://github.com/owner/repo/pull/5";
+      const initialCache = {
+        [prUrl]: { isClosed: false, lastChecked: now - 1000, isError: false },
+        [prUrlErrorValid]: { isClosed: false, lastChecked: now - 1000, isError: true },
+      };
+
+      setPRStatusCacheForTests(initialCache);
+      const fetchStub = sandbox.stub(fetchUtils, "fetchWithTimeout");
+
+      const sessions: Session[] = [
+        {
+          name: "s-valid",
+          title: "s-valid",
+          state: "COMPLETED",
+          rawState: "COMPLETED",
+          outputs: [{ pullRequest: { url: prUrl, title: "PR1", description: "" } }]
+        },
+        {
+          name: "s-error-valid",
+          title: "s-error-valid",
+          state: "COMPLETED",
+          rawState: "COMPLETED",
+          outputs: [{ pullRequest: { url: prUrlErrorValid, title: "PR5", description: "" } }]
+        }
+      ];
+
+      const getTokenStub = sandbox.stub(GitHubAuth, "getToken");
+
+      await updatePreviousStates(sessions, mockContext);
+
+      assert.ok(getTokenStub.notCalled);
+      assert.ok(fetchStub.notCalled);
+    });
+
+    test("updatePreviousStates handles getToken returning undefined", async () => {
+      const prUrl = "https://github.com/owner/repo/pull/1";
+      const sessions: Session[] = [
+        {
+          name: "s1",
+          title: "s1",
+          state: "COMPLETED",
+          rawState: "COMPLETED",
+          outputs: [{ pullRequest: { url: prUrl, title: "PR", description: "" } }]
+        }
+      ];
+
+      const fetchStub = sandbox.stub(fetchUtils, "fetchWithTimeout").resolves({
+        ok: true,
+        json: async () => ({ state: "open" })
+      } as any);
+
+      sandbox.stub(GitHubAuth, "getToken").resolves(undefined);
+
+      await updatePreviousStates(sessions, mockContext);
+
+      assert.ok(fetchStub.calledOnce);
+      const headers = fetchStub.getCall(0).args[1]?.headers as Record<string, string>;
+      assert.strictEqual(headers?.Authorization, undefined);
     });
   });
 
@@ -1258,5 +1499,53 @@ suite("Extension Test Suite", () => {
         assert.strictEqual(err.message, "GitHub API error: 500 - Internal Server Error");
       }
     });
+  });
+
+  test("mergeActivitiesByIdentity retains healthy existing cache when incoming is missing due to failed recovery filtering", async () => {
+    // 既存キャッシュに健全な Activity がある
+    const existingActivities = [
+      {
+        id: "activity-1",
+        name: "sessions/test/activities/activity-1",
+        createTime: "2026-01-01T00:00:00Z",
+        type: "planGenerated",
+        planGenerated: { plan: { title: "Healthy Plan", steps: [] } },
+      } as any
+    ];
+
+    // incoming として、API からページングで破損した Activity (payload 欠落) が返ってくることをシミュレート
+    const fetchStub = sinon.stub(globalThis, "fetch");
+    fetchStub.onFirstCall().resolves({
+      ok: true,
+      json: async () => ({
+        activities: [
+          {
+            id: "activity-1",
+            name: "sessions/test/activities/activity-1",
+            createTime: "2026-01-01T00:00:00Z",
+            type: "planGenerated",
+            // planGenerated payload is missing -> corrupted
+          }
+        ],
+        nextPageToken: undefined
+      })
+    } as any);
+
+    // 回復用の fetchSingleActivity も失敗することをシミュレート (fetchStub の 2 回目)
+    fetchStub.onSecondCall().rejects(new Error("Network failure"));
+
+    // これにより、incoming の fetchSessionActivitiesPaginated は
+    // corrupted な Activity を見つけて回復を試みるが失敗し、
+    // 配列から削除して空の配列を返すはず。
+    const incomingActivities = await fetchSessionActivitiesPaginated("dummyKey", "sessions/test", { showPaginationProgress: false });
+
+    // mergeActivitiesByIdentity で既存キャッシュと結合
+    const mergedResult = mergeActivitiesByIdentity(existingActivities, incomingActivities);
+
+    // 既存の健全なペイロードが維持されていることをアサート
+    assert.strictEqual(mergedResult.length, 1);
+    assert.ok(mergedResult[0].planGenerated);
+    assert.strictEqual((mergedResult[0] as any).planGenerated.plan.title, "Healthy Plan");
+    fetchStub.restore();
   });
 });

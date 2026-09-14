@@ -3,7 +3,51 @@ import * as vscode from 'vscode';
 export class GitHubAuth {
     private static readonly SCOPES = ['repo'];
 
+    private static cachedSession: vscode.AuthenticationSession | undefined = undefined;
+    private static sessionExpiry: number = 0;
+    private static readonly CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+    private static pendingSessionPromise: Promise<vscode.AuthenticationSession | undefined> | undefined = undefined;
+    private static authChangeListenerDisposable: vscode.Disposable | undefined = undefined;
+    private static sessionRequestVersion = 0;
+
+    public static handleAuthChange(event: unknown): void {
+        const providerId = (event as { provider?: { id?: string } }).provider?.id;
+        if (providerId !== 'github') {
+            return;
+        }
+        GitHubAuth.clearCache();
+    }
+
+    private static ensureAuthSessionListener(): void {
+        if (GitHubAuth.authChangeListenerDisposable) {
+            return;
+        }
+
+        const disposable = (vscode.authentication as any).onDidChangeSessions?.call(
+            vscode.authentication,
+            GitHubAuth.handleAuthChange
+        );
+        if (disposable) {
+            GitHubAuth.authChangeListenerDisposable = disposable;
+        }
+    }
+
+    private static cacheSession(
+        session: vscode.AuthenticationSession,
+        requestVersion: number
+    ): void {
+        if (requestVersion !== GitHubAuth.sessionRequestVersion) {
+            return;
+        }
+        GitHubAuth.cachedSession = session;
+        GitHubAuth.sessionExpiry = Date.now() + GitHubAuth.CACHE_TTL;
+    }
+
     static async signIn(): Promise<string | undefined> {
+        GitHubAuth.ensureAuthSessionListener();
+        GitHubAuth.clearCache();
+        const requestVersion = GitHubAuth.sessionRequestVersion;
+
         try {
             const session = await vscode.authentication.getSession(
                 'github',
@@ -11,26 +55,67 @@ export class GitHubAuth {
                 { createIfNone: true }
             );
 
+            if (session) {
+                GitHubAuth.cacheSession(session, requestVersion);
+            } else {
+                GitHubAuth.clearCache();
+            }
+
             return session?.accessToken;
         } catch (error) {
+            GitHubAuth.clearCache();
             vscode.window.showErrorMessage('Failed to sign in to GitHub');
             return undefined;
         }
     }
 
     static async getSession(): Promise<vscode.AuthenticationSession | undefined> {
-        try {
-            return await vscode.authentication.getSession(
-                'github',
-                GitHubAuth.SCOPES,
-                { createIfNone: false }
-            );
-        } catch (error) {
-            return undefined;
+        GitHubAuth.ensureAuthSessionListener();
+
+        const now = Date.now();
+        if (GitHubAuth.cachedSession && now < GitHubAuth.sessionExpiry) {
+            return GitHubAuth.cachedSession;
         }
+
+        if (GitHubAuth.pendingSessionPromise) {
+            return GitHubAuth.pendingSessionPromise;
+        }
+
+        const requestVersion = GitHubAuth.sessionRequestVersion;
+        const promise = (GitHubAuth.pendingSessionPromise = Promise.resolve(vscode.authentication.getSession(
+            'github',
+            GitHubAuth.SCOPES,
+            { createIfNone: false }
+        )).then((session) => {
+            if (requestVersion !== GitHubAuth.sessionRequestVersion) {
+                return undefined;
+            }
+            if (session) {
+                GitHubAuth.cacheSession(session, requestVersion);
+            } else {
+                GitHubAuth.clearCache();
+            }
+
+            return session;
+        }).catch((error) => { 
+            if (requestVersion === GitHubAuth.sessionRequestVersion) {
+                GitHubAuth.clearCache();
+            }
+            return undefined;
+        }).finally(() => {
+            if (GitHubAuth.pendingSessionPromise === promise) {
+                GitHubAuth.pendingSessionPromise = undefined;
+            }
+        }));
+
+        return await promise;
     }
 
     static async getToken(): Promise<string | undefined> {
+        const now = Date.now();
+        if (GitHubAuth.cachedSession && now < GitHubAuth.sessionExpiry) {
+            return GitHubAuth.cachedSession.accessToken;
+        }
         const session = await GitHubAuth.getSession();
         return session?.accessToken;
     }
@@ -50,5 +135,20 @@ export class GitHubAuth {
     static async isSignedIn(): Promise<boolean> {
         const session = await GitHubAuth.getSession();
         return session !== undefined;
+    }
+
+    static clearCache(): void {
+        GitHubAuth.sessionRequestVersion += 1;
+        GitHubAuth.cachedSession = undefined;
+        GitHubAuth.sessionExpiry = 0;
+        GitHubAuth.pendingSessionPromise = undefined;
+    }
+
+    static dispose(): void {
+        if (GitHubAuth.authChangeListenerDisposable) {
+            GitHubAuth.authChangeListenerDisposable.dispose();
+            GitHubAuth.authChangeListenerDisposable = undefined;
+        }
+        GitHubAuth.clearCache();
     }
 }

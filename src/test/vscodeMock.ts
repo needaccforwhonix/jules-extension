@@ -44,6 +44,7 @@ const mockVscode = {
         showWarningMessage: () => undefined,
         showErrorMessage: () => undefined,
         showQuickPick: async () => undefined,
+        showInputBox: async () => undefined,
         withProgress: async (_opts: any, task: any) => {
             const token = {
                 isCancellationRequested: false,
@@ -54,7 +55,20 @@ const mockVscode = {
         showTextDocument: async () => undefined,
         activeTextEditor: undefined,
         visibleTextEditors: [],
-        createTreeView: () => ({ dispose: () => { } }),
+        createTreeView: () => ({
+            dispose: () => { },
+            onDidChangeSelection: () => ({ dispose: () => { } }),
+            onDidChangeVisibility: () => ({ dispose: () => { } }),
+            onDidCollapseElement: () => ({ dispose: () => { } }),
+            onDidExpandElement: () => ({ dispose: () => { } }),
+            reveal: async () => { },
+            selection: [],
+            visible: true,
+            message: "",
+            title: "",
+            description: "",
+            badge: undefined,
+        }),
         createStatusBarItem: () => ({ show: () => { }, hide: () => { }, dispose: () => { } }),
         createOutputChannel: () => ({ append: () => { }, appendLine: () => { }, replace: () => { }, clear: () => { }, show: () => { }, hide: () => { }, dispose: () => { } }),
         registerWebviewViewProvider: () => ({ dispose: () => { } }),
@@ -62,8 +76,14 @@ const mockVscode = {
     env: {
         openExternal: async () => true,
     },
+    ExtensionMode: {
+        Production: 1,
+        Development: 2,
+        Test: 3,
+    },
     authentication: {
         getSession: async () => undefined,
+        onDidChangeSessions: () => ({ dispose: () => { } }),
     },
     extensions: {
         getExtension: () => undefined,
@@ -79,6 +99,14 @@ const mockVscode = {
             fsPath: value.replace(/^file:\/\//, ""),
             toString: () => value,
         }),
+        joinPath: (base: any, ...paths: string[]) => {
+            const fsPath = [base.fsPath, ...paths].join("/").replace(/\/+/g, "/");
+            return {
+                fsPath,
+                scheme: base.scheme,
+                toString: () => `${base.scheme || "file"}://${fsPath}`,
+            };
+        },
     },
     FileType: {
         File: 1,
@@ -225,6 +253,12 @@ const mockVscode = {
         constructor(id: string, color?: any) {
             this.id = id;
             this.color = color;
+        }
+    },
+    ThemeColor: class ThemeColor {
+        id: string;
+        constructor(id: string) {
+            this.id = id;
         }
     },
     StatusBarAlignment: {

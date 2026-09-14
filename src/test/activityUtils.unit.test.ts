@@ -1,8 +1,13 @@
 import * as assert from "assert";
 import {
     getActivityCategory,
+    getActivityIcon,
     getActivityLabelPrefix,
     getActivitySummaryText,
+    getActivityThemeIcon,
+    getActivityTypeLabel,
+    isActivityCorrupted,
+    summarizeArtifacts,
 } from "../activityUtils";
 import type { Activity } from "../types";
 
@@ -97,6 +102,33 @@ suite("activityUtils getActivityCategory", () => {
     });
 });
 
+suite("activityUtils getActivityTypeLabel", () => {
+    test("planGenerated -> Plan generated", () => {
+        assert.strictEqual(getActivityTypeLabel("planGenerated"), "Plan generated");
+    });
+    test("planApproved -> Plan approved", () => {
+        assert.strictEqual(getActivityTypeLabel("planApproved"), "Plan approved");
+    });
+    test("agentMessaged -> Agent messaged", () => {
+        assert.strictEqual(getActivityTypeLabel("agentMessaged"), "Agent messaged");
+    });
+    test("userMessaged -> User messaged", () => {
+        assert.strictEqual(getActivityTypeLabel("userMessaged"), "User messaged");
+    });
+    test("progressUpdated -> Progress updated", () => {
+        assert.strictEqual(getActivityTypeLabel("progressUpdated"), "Progress updated");
+    });
+    test("sessionCompleted -> Session completed", () => {
+        assert.strictEqual(getActivityTypeLabel("sessionCompleted"), "Session completed");
+    });
+    test("sessionFailed -> Session failed", () => {
+        assert.strictEqual(getActivityTypeLabel("sessionFailed"), "Session failed");
+    });
+    test("unknown key falls back to Activity", () => {
+        assert.strictEqual(getActivityTypeLabel("unknown" as any), "Activity");
+    });
+});
+
 suite("activityUtils getActivityLabelPrefix", () => {
     test("planGenerated has Plan prefix", () => {
         const activity = mockActivity({
@@ -108,6 +140,27 @@ suite("activityUtils getActivityLabelPrefix", () => {
     test("sessionFailed has FAILED prefix", () => {
         const activity = mockActivity({ sessionFailed: { reason: "error" } });
         assert.strictEqual(getActivityLabelPrefix(activity), "FAILED: ");
+    });
+
+    test("planApproved -> Approved: ", () => {
+        assert.strictEqual(getActivityLabelPrefix(mockActivity({ planApproved: { planId: "p1" } })), "Approved: ");
+    });
+
+    test("sessionCompleted -> Completed: ", () => {
+        assert.strictEqual(getActivityLabelPrefix(mockActivity({ sessionCompleted: {} })), "Completed: ");
+    });
+
+    test("artifacts with changeSet -> (diff) ", () => {
+        assert.strictEqual(
+            getActivityLabelPrefix(
+                mockActivity({ artifacts: [{ changeSet: { source: "s1" } as any }] }),
+            ),
+            "(diff) ",
+        );
+    });
+
+    test("agentMessaged -> empty prefix", () => {
+        assert.strictEqual(getActivityLabelPrefix(mockActivity({ agentMessaged: { agentMessage: "hello" } })), "");
     });
 });
 
@@ -137,5 +190,212 @@ suite("activityUtils getActivitySummaryText", () => {
     test("sessionFailed with whitespace-only reason", () => {
         const activity = mockActivity({ sessionFailed: { reason: "   " } });
         assert.strictEqual(getActivitySummaryText(activity), "Session failed");
+    });
+
+    test("falls back to description", () => {
+        assert.strictEqual(
+            getActivitySummaryText(mockActivity({ description: "  described work  " })),
+            "described work",
+        );
+    });
+
+    test("falls back to artifacts summary", () => {
+        assert.strictEqual(
+            getActivitySummaryText(
+                mockActivity({
+                    description: undefined,
+                    artifacts: [{ media: { uri: "file:///tmp/image.png" } }],
+                }),
+            ),
+            "Artifacts: media",
+        );
+    });
+
+    test("falls back to active key label", () => {
+        assert.strictEqual(
+            getActivitySummaryText(mockActivity({ description: undefined, planApproved: { planId: "p1" } })),
+            "Plan approved",
+        );
+    });
+
+    test("falls back to metadata (originator and time)", () => {
+        assert.strictEqual(
+            getActivitySummaryText(
+                mockActivity({ description: undefined, originator: "user", createTime: "2026-03-02T00:00:00Z" }),
+            ),
+            "Activity (originator=user, time=2026-03-02T00:00:00Z)",
+        );
+    });
+
+    test("falls back to metadata without createTime", () => {
+        assert.strictEqual(
+            getActivitySummaryText(
+                mockActivity({ description: undefined, createTime: undefined }),
+            ),
+            "Activity (originator=agent)",
+        );
+    });
+
+    test("falls back to metadata when multiple active keys present", () => {
+        assert.strictEqual(
+            getActivitySummaryText(
+                mockActivity({ description: undefined, planApproved: { planId: "p1" }, sessionCompleted: {} }),
+            ),
+            "Activity (originator=agent, time=2026-03-01T00:00:00Z)",
+        );
+    });
+});
+
+suite("activityUtils getActivityIcon", () => {
+    test("returns the plan generated icon", () => {
+        assert.strictEqual(
+            getActivityIcon(mockActivity({ planGenerated: { plan: { title: "p1", steps: [] } as any } })),
+            "📝",
+        );
+    });
+
+    test("returns the plan approved icon", () => {
+        assert.strictEqual(
+            getActivityIcon(mockActivity({ planApproved: { planId: "p1" } })),
+            "👍",
+        );
+    });
+
+    test("returns the progress updated icon", () => {
+        assert.strictEqual(
+            getActivityIcon(mockActivity({ progressUpdated: { title: "Working", description: "" } })),
+            "🔄",
+        );
+    });
+
+    test("returns the session completed icon", () => {
+        assert.strictEqual(
+            getActivityIcon(mockActivity({ sessionCompleted: {} })),
+            "✅",
+        );
+    });
+
+    test("returns the session failed icon", () => {
+        assert.strictEqual(
+            getActivityIcon(mockActivity({ sessionFailed: { reason: "boom" } })),
+            "❌",
+        );
+    });
+
+    test("returns the agent messaged icon", () => {
+        assert.strictEqual(
+            getActivityIcon(mockActivity({ agentMessaged: { agentMessage: "hello" } })),
+            "💬",
+        );
+    });
+
+    test("returns the user messaged icon", () => {
+        assert.strictEqual(
+            getActivityIcon(mockActivity({ userMessaged: {} })),
+            "🗨️",
+        );
+    });
+
+    test("returns the fallback icon when multiple active keys are present", () => {
+        assert.strictEqual(
+            getActivityIcon(mockActivity({ agentMessaged: { agentMessage: "hi" }, userMessaged: {} })),
+            "ℹ️",
+        );
+    });
+
+    test("returns the fallback icon when no active key is present", () => {
+        assert.strictEqual(getActivityIcon(mockActivity()), "ℹ️");
+    });
+});
+
+suite("activityUtils summarizeArtifacts", () => {
+    test("returns null for empty inputs and summarizes unique artifact types in insertion order", () => {
+        assert.strictEqual(summarizeArtifacts(undefined), null);
+        assert.strictEqual(summarizeArtifacts([]), null);
+        assert.strictEqual(summarizeArtifacts([{}]), null);
+        assert.strictEqual(
+            summarizeArtifacts([
+                { changeSet: {} },
+                { bashOutput: { command: "pnpm test" } as any },
+                { media: { uri: "file:///tmp/screenshot.png" } },
+                { changeSet: {} },
+            ]),
+            "Artifacts: changeSet, bashOutput, media",
+        );
+    });
+});
+
+suite("activityUtils isActivityCorrupted", () => {
+    test("returns false for a completely valid activity with matching type and payload", () => {
+        const activity = mockActivity({
+            type: "planGenerated",
+            planGenerated: { plan: { title: "p1", steps: [] } as any },
+        });
+        assert.strictEqual(isActivityCorrupted(activity), false);
+    });
+
+    test("returns true for a corrupted activity missing its payload", () => {
+        const activity = mockActivity({
+            type: "planGenerated",
+            // Notice: no planGenerated field is present
+        });
+        assert.strictEqual(isActivityCorrupted(activity), true);
+    });
+
+    test("returns false when type is undefined but some other payload exists", () => {
+        const activity = mockActivity({
+            type: undefined,
+            agentMessaged: { agentMessage: "Hello" },
+        });
+        assert.strictEqual(isActivityCorrupted(activity), false);
+    });
+
+    test("returns false when type does not belong to union keys", () => {
+        const activity = mockActivity({
+            type: "customUnknownType",
+        });
+        assert.strictEqual(isActivityCorrupted(activity), false);
+    });
+});
+
+suite("activityUtils getActivityThemeIcon", () => {
+    test("sessionFailed maps to error icon", () => {
+        assert.strictEqual(getActivityThemeIcon(mockActivity({ sessionFailed: { reason: "error" } }))?.id, "error");
+    });
+
+    test("planGenerated maps to lightbulb icon", () => {
+        assert.strictEqual(getActivityThemeIcon(mockActivity({ planGenerated: { plan: { title: "p1", steps: [] } as any } }))?.id, "lightbulb");
+    });
+
+    test("planApproved maps to check icon", () => {
+        assert.strictEqual(getActivityThemeIcon(mockActivity({ planApproved: { planId: "p1" } }))?.id, "check");
+    });
+
+    test("sessionCompleted maps to pass icon", () => {
+        assert.strictEqual(getActivityThemeIcon(mockActivity({ sessionCompleted: {} }))?.id, "pass");
+    });
+
+    test("progressUpdated maps to pulse icon", () => {
+        assert.strictEqual(getActivityThemeIcon(mockActivity({ progressUpdated: { title: "Working", description: "" } }))?.id, "pulse");
+    });
+
+    test("agentMessaged maps to comment icon", () => {
+        assert.strictEqual(getActivityThemeIcon(mockActivity({ agentMessaged: { agentMessage: "hello" } }))?.id, "comment");
+    });
+
+    test("userMessaged maps to account icon", () => {
+        assert.strictEqual(getActivityThemeIcon(mockActivity({ userMessaged: {} }))?.id, "account");
+    });
+
+    test("artifacts with changeSet maps to diff icon", () => {
+        assert.strictEqual(getActivityThemeIcon(mockActivity({ artifacts: [{ changeSet: { source: "s1" } as any }] }))?.id, "diff");
+    });
+
+    test("artifacts with bashOutput maps to terminal icon", () => {
+        assert.strictEqual(getActivityThemeIcon(mockActivity({ artifacts: [{ bashOutput: { command: "pnpm test" } }] }))?.id, "terminal");
+    });
+
+    test("unhandled activity returns undefined", () => {
+        assert.strictEqual(getActivityThemeIcon(mockActivity({ description: "unknown event", artifacts: [] }))?.id, undefined);
     });
 });

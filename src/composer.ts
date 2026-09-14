@@ -25,6 +25,7 @@ export async function showMessageComposer(
     {
       enableScripts: true,
       retainContextWhenHidden: true,
+      localResourceRoots: [],
     }
   );
 
@@ -89,7 +90,7 @@ export function getComposerHtml(
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource}; script-src 'nonce-${nonce}'; style-src ${webview.cspSource} 'nonce-${nonce}';" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; base-uri 'none'; object-src 'none'; img-src ${webview.cspSource}; script-src 'nonce-${nonce}'; style-src ${webview.cspSource} 'nonce-${nonce}';" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>${title}</title>
 <style nonce="${nonce}">
@@ -120,8 +121,13 @@ export function getComposerHtml(
     line-height: 1.5;
   }
 
-  textarea:focus {
+  textarea:focus-visible {
     outline: 1px solid var(--vscode-focusBorder);
+  }
+
+  textarea:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   .actions {
@@ -159,11 +165,11 @@ export function getComposerHtml(
     color: var(--vscode-button-foreground);
   }
 
-  button.primary:hover {
+  button.primary:hover:not(:disabled) {
     background: var(--vscode-button-hoverBackground);
   }
 
-  button:not(.primary):hover {
+  button:not(.primary):hover:not(:disabled) {
     background: var(--vscode-button-secondaryHoverBackground);
   }
 
@@ -187,13 +193,55 @@ export function getComposerHtml(
     outline-offset: 2px;
   }
 
+  input[type="checkbox"]:disabled,
+  input[type="checkbox"]:disabled + label {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
   label {
     cursor: pointer;
+  }
+
+
+  .spinner {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.75s linear infinite;
+    vertical-align: middle;
+    margin-left: 6px;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .spinner {
+      animation: none;
+    }
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border-width: 0;
   }
 </style>
 </head>
 <body>
-  <textarea id="message" aria-label="${placeholder || 'Message input'}" placeholder="${placeholder}" autofocus>${value}</textarea>
+  <div id="sr-status" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+  <textarea id="message" aria-label="${placeholder || 'Message input'}" placeholder="${placeholder}" autofocus required>${value}</textarea>
   <div class="actions">
     ${createPrCheckbox}
     ${requireApprovalCheckbox}
@@ -210,6 +258,8 @@ export function getComposerHtml(
     const validate = () => {
       const isValid = textarea.value.trim().length > 0;
       submitButton.disabled = !isValid;
+      submitButton.title = isValid ? 'Send (Cmd/Ctrl+Enter)' : 'Type a message to send';
+      submitButton.setAttribute('aria-label', isValid ? 'Send message (Cmd/Ctrl+Enter)' : 'Type a message to send');
       return isValid;
     };
 
@@ -219,11 +269,28 @@ export function getComposerHtml(
       }
 
       submitButton.disabled = true;
-      submitButton.innerText = 'Sending...';
+      submitButton.textContent = 'Sending... ';
+      const spinnerSpan = document.createElement('span');
+      spinnerSpan.className = 'spinner';
+      submitButton.appendChild(spinnerSpan);
+      submitButton.setAttribute('aria-busy', 'true');
+      submitButton.title = 'Sending message...';
+      submitButton.setAttribute('aria-label', 'Sending message...');
+      const srStatus = document.getElementById('sr-status');
+      if (srStatus) srStatus.textContent = 'Sending message...';
       textarea.disabled = true;
-      if (createPrCheckbox) createPrCheckbox.disabled = true;
-      if (requireApprovalCheckbox) requireApprovalCheckbox.disabled = true;
-      document.getElementById('cancel').disabled = true;
+      if (createPrCheckbox) {
+        createPrCheckbox.disabled = true;
+      }
+      if (requireApprovalCheckbox) {
+        requireApprovalCheckbox.disabled = true;
+      }
+      const cancelButton = document.getElementById('cancel');
+      if (cancelButton) {
+        cancelButton.disabled = true;
+        cancelButton.title = 'Cannot cancel while sending';
+        cancelButton.setAttribute('aria-label', 'Cannot cancel while sending');
+      }
       document.body.style.cursor = 'wait';
 
       vscode.postMessage({

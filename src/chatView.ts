@@ -2,6 +2,7 @@ import { CHAT_CSS, CHAT_JS } from "./webview/chatAssets";
 import * as crypto from "crypto";
 import * as vscode from "vscode";
 import MarkdownIt from "markdown-it";
+import sanitizeHtml from "sanitize-html";
 import {
   pickFirstNonEmpty,
   getActivitySummaryText,
@@ -56,7 +57,7 @@ export async function initMarkdownRenderer(): Promise<void> {
           ? defaultFence(tokens, idx, options, env, self)
           : self.renderToken(tokens, idx, options);
         return (
-          '<div class="code-block"><button class="copy-code-button" type="button" title="Copy code">Copy</button>' +
+          '<div class="code-block"><button class="copy-code-button" type="button" title="Copy code" aria-label="Copy code" aria-live="polite" aria-atomic="true">Copy</button>' +
           rendered +
           "</div>"
         );
@@ -110,11 +111,47 @@ export async function initMarkdownRenderer(): Promise<void> {
   return markdownRendererInit;
 }
 
+/**
+ * Default options for sanitize-html to prevent XSS.
+ * Includes additional obsolete/dangerous tags like xmp, listing, and plaintext in nonTextTags.
+ */
+const DEFAULT_SANITIZER_OPTIONS: sanitizeHtml.IOptions = {
+  allowedTags: sanitizeHtml.defaults.allowedTags.concat([
+    "img",
+    "details",
+    "summary",
+    "button",
+  ]),
+  allowedAttributes: {
+    ...sanitizeHtml.defaults.allowedAttributes,
+    "*": ["class", "id", "data-*", "aria-*"],
+    button: ["type", "title"],
+  },
+  nonTextTags: [
+    "script",
+    "style",
+    "textarea",
+    "option",
+    "xmp",
+    "listing",
+    "plaintext",
+  ],
+  allowedSchemes: ["http", "https", "mailto", "vscode-webview-resource"],
+  allowedSchemesByTag: {
+    img: ["data", "http", "https", "vscode-webview-resource"],
+  },
+};
+
+/**
+ * Renders markdown content to HTML and sanitizes it.
+ * @param markdown - The markdown string to render.
+ * @returns The sanitized HTML string.
+ */
 export function renderChatMarkdown(markdown: string): string {
   if (!markdownRenderer) {
     return escapeHtml(markdown);
   }
-  return markdownRenderer.render(markdown);
+  return sanitizeHtml(markdownRenderer.render(markdown), DEFAULT_SANITIZER_OPTIONS);
 }
 
 const GENERATING_SESSION_STATES: ReadonlySet<string> = new Set([
@@ -213,6 +250,8 @@ export function buildChatMessagesFromActivities(
       getActivityLabelPrefix(activity) +
       getActivitySummaryText(activity);
     let detailsHtml = "";
+    // We lazy load large details: plan, diff, artifacts
+    const actId = escapeHtml(activity.id ?? activity.name);
     if (activity.sessionFailed?.reason) {
       detailsHtml +=
         '<details class="activity-details"><summary>View Error Details</summary><div class="details-content code-block"><pre><code>' +
@@ -221,17 +260,13 @@ export function buildChatMessagesFromActivities(
     }
     if (activity.planGenerated?.plan) {
       detailsHtml +=
-        '<details class="activity-details"><summary>View Plan</summary><div class="details-content">' +
-        renderChatMarkdown(formatFullPlan(activity.planGenerated.plan)) +
-        "</div></details>";
+        '<details class="activity-details" data-activity-id="' + actId + '" data-detail-type="plan"><summary>View Plan</summary><div class="details-content">Loading...</div></details>';
     }
     if ((activity as any).gitPatch?.diff) {
       const diff = (activity as any).gitPatch.diff;
       if (typeof diff === "string" && diff.trim().length > 0) {
         detailsHtml +=
-          '<details class="activity-details"><summary>View Diff</summary><div class="details-content">' +
-          renderChatMarkdown("```diff\n" + diff + "\n```") +
-          "</div></details>";
+          '<details class="activity-details" data-activity-id="' + actId + '" data-detail-type="diff"><summary>View Diff</summary><div class="details-content">Loading...</div></details>';
       }
     }
     if (activity.artifacts && activity.artifacts.length > 0) {
@@ -240,24 +275,14 @@ export function buildChatMessagesFromActivities(
           const diffData = (artifact.changeSet as any).gitPatch?.unidiffPatch;
           if (diffData && typeof diffData === "string") {
             detailsHtml +=
-              '<details class="activity-details"><summary>View ChangeSet (' +
+              '<details class="activity-details" data-activity-id="' + actId + '" data-detail-type="changeset" data-index="' + i + '"><summary>View ChangeSet (' +
               (i + 1) +
-              ')</summary><div class="details-content">' +
-              renderChatMarkdown("```diff\n" + diffData + "\n```") +
-              "</div></details>";
+              ')</summary><div class="details-content">Loading...</div></details>';
           } else {
-            let raw = "";
-            try {
-              raw = JSON.stringify(artifact.changeSet, null, 2);
-            } catch {
-              raw = String(artifact.changeSet);
-            }
             detailsHtml +=
-              '<details class="activity-details"><summary>View ChangeSet Details (' +
+              '<details class="activity-details" data-activity-id="' + actId + '" data-detail-type="changeset-raw" data-index="' + i + '"><summary>View ChangeSet Details (' +
               (i + 1) +
-              ')</summary><div class="details-content">' +
-              renderChatMarkdown("```json\n" + raw + "\n```") +
-              "</div></details>";
+              ')</summary><div class="details-content">Loading...</div></details>';
           }
         }
         if (artifact.bashOutput) {
@@ -270,20 +295,10 @@ export function buildChatMessagesFromActivities(
           const stdout = outRec.stdout;
           const stderr = outRec.stderr;
           if (commandLine || stdout || stderr) {
-            const out = (
-              "> " +
-              (commandLine || "Command") +
-              "\n" +
-              (stdout || "") +
-              "\n" +
-              (stderr || "")
-            ).trim();
             detailsHtml +=
-              '<details class="activity-details"><summary>View Bash Output (' +
+              '<details class="activity-details" data-activity-id="' + actId + '" data-detail-type="bash" data-index="' + i + '"><summary>View Bash Output (' +
               (i + 1) +
-              ')</summary><div class="details-content">' +
-              renderChatMarkdown("```bash\n" + out + "\n```") +
-              "</div></details>";
+              ')</summary><div class="details-content">Loading...</div></details>';
           }
         }
       });
@@ -292,11 +307,13 @@ export function buildChatMessagesFromActivities(
       id: activity.id ?? activity.name,
       role: "assistant",
       createTime: activity.createTime,
-      html:
+      html: sanitizeHtml(
         '<div class="activity-log"><em>' +
-        escapeHtml(combinedText) +
-        "</em></div>" +
-        detailsHtml,
+          escapeHtml(combinedText) +
+          "</em></div>" +
+          detailsHtml,
+        DEFAULT_SANITIZER_OPTIONS
+      ),
     });
   });
   return messages;
@@ -317,18 +334,27 @@ export class JulesChatViewProvider implements vscode.WebviewViewProvider {
       sessionId: string,
       message: string,
     ) => Promise<void>,
+    private readonly extensionUri: vscode.Uri,
   ) {}
   async resolveWebviewView(webviewView: vscode.WebviewView): Promise<void> {
     await initMarkdownRenderer();
     this.view = webviewView;
-    webviewView.webview.options = { enableScripts: true };
+    webviewView.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, "dist")],
+    };
     webviewView.webview.html = getChatWebviewHtml(
       webviewView.webview,
       getNonce(),
+      this.extensionUri,
     );
     webviewView.webview.onDidReceiveMessage(async (message) => {
       if (message?.type === "requestInitialState") {
         this.postState();
+        return;
+      }
+      if (message?.type === "requestDetails") {
+        this.handleRequestDetails(message);
         return;
       }
       if (message?.type !== "sendMessage") {
@@ -379,6 +405,74 @@ export class JulesChatViewProvider implements vscode.WebviewViewProvider {
     };
     this.postState();
   }
+  private handleRequestDetails(message: any): void {
+    if (!this.view || !message.activityId || !message.detailType) {
+      return;
+    }
+    const activity = this.activities.find(
+      (a) => (a.id ?? a.name) === message.activityId,
+    );
+    if (!activity) {
+      return;
+    }
+    let html = "Not found";
+    if (message.detailType === "plan" && activity.planGenerated?.plan) {
+      html = renderChatMarkdown(formatFullPlan(activity.planGenerated.plan));
+    } else if (message.detailType === "diff" && (activity as any).gitPatch?.diff) {
+      const diff = (activity as any).gitPatch.diff;
+      if (typeof diff === "string") {
+        html = renderChatMarkdown("```diff\n" + diff + "\n```");
+      }
+    } else if (activity.artifacts && typeof message.index === "number") {
+      const artifact = activity.artifacts[message.index];
+      if (artifact) {
+        if (message.detailType === "changeset" && artifact.changeSet) {
+          const diffData = (artifact.changeSet as any).gitPatch?.unidiffPatch;
+          if (diffData && typeof diffData === "string") {
+            html = renderChatMarkdown("```diff\n" + diffData + "\n```");
+          }
+        } else if (message.detailType === "changeset-raw" && artifact.changeSet) {
+          let raw = "";
+          try {
+            raw = JSON.stringify(artifact.changeSet, null, 2);
+          } catch {
+            raw = String(artifact.changeSet);
+          }
+          html = renderChatMarkdown("```json\n" + raw + "\n```");
+        } else if (message.detailType === "bash" && artifact.bashOutput) {
+          const outRec = artifact.bashOutput as Record<string, any>;
+          let commandLine = outRec.commandLine;
+          const commands = outRec.commands;
+          if (commands && Array.isArray(commands) && commands.length > 0) {
+            commandLine = commands[0].commandLine;
+          }
+          const stdout = outRec.stdout;
+          const stderr = outRec.stderr;
+          const out = (
+            "> " +
+            (commandLine || "Command") +
+            "\n" +
+            (stdout || "") +
+            "\n" +
+            (stderr || "")
+          ).trim();
+          html = renderChatMarkdown("```bash\n" + out + "\n```");
+        }
+      }
+    }
+    void Promise.resolve(
+      this.view.webview.postMessage({
+        type: "detailsHtml",
+        activityId: message.activityId,
+        detailType: message.detailType,
+        index: message.index,
+        html,
+      }),
+    ).catch((err: unknown) =>
+      console.error("Jules: Failed to post detailsHtml to chat view:", err),
+    );
+  }
+
   private postState(): void {
     if (!this.view) {
       return;
@@ -391,12 +485,26 @@ export class JulesChatViewProvider implements vscode.WebviewViewProvider {
   }
 }
 
+function getDOMPurifyScriptUri(
+  webview: vscode.Webview,
+  extensionUri: vscode.Uri,
+): string {
+  const domPurifyUri = vscode.Uri.joinPath(
+    extensionUri,
+    "dist",
+    "purify.min.js",
+  );
+  return webview.asWebviewUri(domPurifyUri).toString();
+}
+
 export function getChatWebviewHtml(
   webview: vscode.Webview,
   nonce: string,
+  extensionUri: vscode.Uri,
 ): string {
+  const domPurifyScriptUri = getDOMPurifyScriptUri(webview, extensionUri);
   return (
-    '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8" /><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src ' +
+    '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8" /><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; base-uri \'none\'; object-src \'none\'; style-src ' +
     webview.cspSource +
     " 'nonce-" +
     nonce +
@@ -406,7 +514,11 @@ export function getChatWebviewHtml(
     nonce +
     '">' +
     CHAT_CSS +
-    '</style></head><body><div id="chat"></div><div id="typing" class="typing" aria-live="polite" aria-label="Jules is working"><span>Jules is working</span><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></div><form id="composer"><textarea id="messageInput" aria-label="Enter message" placeholder="Enter message (Ctrl/Cmd+Enter to send)"></textarea><div class="composer-actions"><div id="sessionLabel" class="session-label">Session: None selected</div><button id="sendButton" type="submit" aria-label="Send message" disabled>Send</button></div></form><script nonce="' +
+    '</style></head><body><div id="chat"></div><div id="typing" class="typing" aria-live="polite" aria-atomic="true" aria-label="Jules is working"><span>Jules is working</span><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></div><form id="composer"><textarea id="messageInput" aria-label="Enter message" placeholder="Enter message (Ctrl/Cmd+Enter to send)" required></textarea><div class="composer-actions"><div id="sessionLabel" class="session-label" aria-live="polite" aria-atomic="true">Session: None selected</div><button id="sendButton" type="submit" aria-label="Send message" disabled>Send</button></div></form><script nonce="' +
+    nonce +
+    '" src="' +
+    domPurifyScriptUri +
+    '"></script><script nonce="' +
     nonce +
     '">' +
     CHAT_JS +

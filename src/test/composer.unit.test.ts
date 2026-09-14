@@ -89,6 +89,29 @@ suite("Composer Test Suite", () => {
       assert.ok(harness.panel.webview.html.includes("<title>Composer</title>"));
     });
 
+    test("should disable local resource access for the composer webview", async () => {
+      const harness = installPanelStub();
+      const createWebviewPanel = (vscode.window as any)
+        .createWebviewPanel as sinon.SinonStub;
+
+      const promise = showMessageComposer({ title: "Composer" });
+
+      sinon.assert.calledOnceWithExactly(
+        createWebviewPanel,
+        "julesMessageComposer",
+        "Composer",
+        vscode.ViewColumn.Active,
+        {
+          enableScripts: true,
+          retainContextWhenHidden: true,
+          localResourceRoots: [],
+        }
+      );
+
+      harness.emitMessage({ type: "cancel" });
+      await promise;
+    });
+
     test("should resolve undefined on cancel", async () => {
       const harness = installPanelStub();
 
@@ -142,7 +165,7 @@ suite("Composer Test Suite", () => {
       assert.ok(html.includes("<title>&lt;Title&gt;</title>"));
       assert.ok(
         html.includes(
-          `<textarea id="message" aria-label="Your &quot;placeholder&quot;" placeholder="Your &quot;placeholder&quot;" autofocus>`
+          `<textarea id="message" aria-label="Your &quot;placeholder&quot;" placeholder="Your &quot;placeholder&quot;" autofocus required>`
         )
       );
       assert.ok(html.includes(">Initial &amp; value</textarea>"));
@@ -313,6 +336,7 @@ suite("Composer Test Suite", () => {
         "nonce-123"
       );
       assert.ok(html.includes('button:disabled {'));
+      assert.ok(!html.includes('button[aria-disabled="true"]'));
       assert.ok(html.includes('opacity: 0.5;'));
       assert.ok(html.includes('cursor: not-allowed;'));
     });
@@ -325,7 +349,11 @@ suite("Composer Test Suite", () => {
       );
       assert.match(
         html,
-        /button:not\(\.primary\):hover\s*{\s*background:\s*var\(--vscode-button-secondaryHoverBackground\);\s*}/
+        /button\.primary:hover:not\(:disabled\)\s*\{\s*background:\s*var\(--vscode-button-hoverBackground\);\s*\}/
+      );
+      assert.match(
+        html,
+        /button:not\(\.primary\):hover:not\(:disabled\)\s*\{\s*background:\s*var\(--vscode-button-secondaryHoverBackground\);\s*\}/
       );
     });
 
@@ -490,14 +518,33 @@ suite("Composer Test Suite", () => {
       assert.ok(html.includes(`<script nonce="${testNonce}">`));
     });
 
+    test("should include base-uri 'none' in Content-Security-Policy", () => {
+      const html = getComposerHtml(
+        mockWebview,
+        { title: "Test" },
+        "nonce-123"
+      );
+      assert.ok(html.includes("base-uri 'none'"));
+    });
+
+    test("should include object-src 'none' in Content-Security-Policy", () => {
+      const html = getComposerHtml(
+        mockWebview,
+        { title: "Test" },
+        "nonce-123"
+      );
+      assert.ok(html.includes("object-src 'none'"));
+    });
+
     test("should set submitButton disabled state based on validation result", () => {
       const html = getComposerHtml(
         mockWebview,
         { title: "Test" },
         "nonce-123"
       );
-      // The validate function should set submitButton.disabled
+      // The validate function should set native disabled state.
       assert.ok(html.includes('submitButton.disabled = !isValid;'));
+      assert.ok(!html.includes("submitButton.setAttribute('aria-disabled'"));
     });
 
     test("should prevent default on Cmd/Ctrl+Enter before validation", () => {
@@ -579,11 +626,51 @@ suite("Composer Test Suite", () => {
         "nonce-123"
       );
       // Check for loading state logic
-      assert.ok(html.includes("submitButton.innerText = 'Sending...';"));
+      assert.ok(html.includes("submitButton.textContent = 'Sending... ';"));
+      assert.ok(html.includes("const spinnerSpan = document.createElement('span');"));
+      assert.ok(html.includes("spinnerSpan.className = 'spinner';"));
+      assert.ok(html.includes("submitButton.appendChild(spinnerSpan);"));
+      assert.ok(html.includes("submitButton.setAttribute('aria-busy', 'true');"));
+      assert.ok(html.includes("submitButton.title = 'Sending message...';"));
+      assert.ok(html.includes("submitButton.setAttribute('aria-label', 'Sending message...');"));
+      assert.ok(html.includes("const srStatus = document.getElementById('sr-status');"));
+      assert.ok(html.includes("if (srStatus) srStatus.textContent = 'Sending message...';"));
       assert.ok(html.includes("submitButton.disabled = true;"));
       assert.ok(html.includes("textarea.disabled = true;"));
-      assert.ok(html.includes("document.getElementById('cancel').disabled = true;"));
+      assert.ok(html.includes("const cancelButton = document.getElementById('cancel');"));
+      assert.ok(html.includes("if (cancelButton) {"));
+      assert.ok(html.includes("cancelButton.disabled = true;"));
+      assert.ok(html.includes("cancelButton.title = 'Cannot cancel while sending';"));
+      assert.ok(html.includes("cancelButton.setAttribute('aria-label', 'Cannot cancel while sending');"));
       assert.ok(html.includes("document.body.style.cursor = 'wait';"));
+    });
+
+    test("should include prefers-reduced-motion media query for spinner", () => {
+      const html = getComposerHtml(
+        mockWebview,
+        { title: "Test" },
+        "nonce-123"
+      );
+      assert.ok(html.includes("@media (prefers-reduced-motion: reduce)"));
+      assert.ok(html.includes("animation: none;"));
+    });
+
+    test("should update aria-label and title in validate function", () => {
+      const html = getComposerHtml(
+        mockWebview,
+        { title: "Test" },
+        "nonce-123"
+      );
+      assert.ok(
+        html.includes(
+          "submitButton.title = isValid ? 'Send (Cmd/Ctrl+Enter)' : 'Type a message to send';"
+        )
+      );
+      assert.ok(
+        html.includes(
+          "submitButton.setAttribute('aria-label', isValid ? 'Send message (Cmd/Ctrl+Enter)' : 'Type a message to send');"
+        )
+      );
     });
 
     test("should disable checkboxes in loading state when present", () => {
@@ -592,8 +679,10 @@ suite("Composer Test Suite", () => {
         { title: "Test", showCreatePrCheckbox: true, showRequireApprovalCheckbox: true },
         "nonce-123"
       );
-      assert.ok(html.includes("if (createPrCheckbox) createPrCheckbox.disabled = true;"));
-      assert.ok(html.includes("if (requireApprovalCheckbox) requireApprovalCheckbox.disabled = true;"));
+      assert.ok(html.includes("if (createPrCheckbox) {"));
+      assert.ok(html.includes("createPrCheckbox.disabled = true;"));
+      assert.ok(html.includes("if (requireApprovalCheckbox) {"));
+      assert.ok(html.includes("requireApprovalCheckbox.disabled = true;"));
     });
   });
 });

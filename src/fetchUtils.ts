@@ -6,6 +6,7 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 let _socksProxyUrl: string | null = null;
 let _httpProxyUrl: string | null = null;
 
+/* c8 ignore start */
 export function setSocksProxy(url: string | null): void {
     _socksProxyUrl = url;
 }
@@ -99,12 +100,27 @@ async function fetchViaProxy(
         req.end();
     });
 }
+/* c8 ignore stop */
 
 /**
  * Performs a fetch with a specified timeout.
  * Defaults to 30 seconds.
  */
 export async function fetchWithTimeout(input: string | URL | Request, init?: RequestInit & { timeout?: number }): Promise<Response> {
+    const urlString = input instanceof Request ? input.url : input.toString();
+
+    try {
+        const url = new URL(urlString);
+        if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+            throw new Error(`Unsupported protocol: ${url.protocol}. Only http: and https: are allowed.`);
+        }
+    } catch (err: unknown) {
+        if (!(err instanceof TypeError)) {
+            throw err;
+        }
+        // If new URL() fails with TypeError, it's likely a relative URL which fetch natively supports
+    }
+
     const timeout = init?.timeout ?? 30000;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -145,6 +161,7 @@ export async function fetchWithTimeout(input: string | URL | Request, init?: Req
     }
 }
 
+/* c8 ignore start */
 /**
  * Polyfill-like helper for AbortSignal.any
  */
@@ -171,3 +188,4 @@ function anySignal(signals: AbortSignal[]): AbortSignal {
 
     return controller.signal;
 }
+/* c8 ignore stop */

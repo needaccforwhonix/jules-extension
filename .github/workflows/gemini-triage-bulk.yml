@@ -49,7 +49,7 @@ jobs:
         steps:
             - name: "Get repository labels"
               id: "get_labels"
-              uses: "actions/github-script@v8"
+              uses: "actions/github-script@v9"
               with:
                   script: |-
                       const { data: labels } = await github.rest.issues.listLabelsForRepo({
@@ -70,6 +70,7 @@ jobs:
               id: "gemini_issue_analysis"
               uses: "google-github-actions/run-gemini-cli@v0" # ratchet:exclude
               env:
+                  GEMINI_CLI_TRUST_WORKSPACE: "true"
                   GITHUB_TOKEN: "${{ github.token }}"
                   ISSUES_TO_TRIAGE: "${{ inputs.issues_to_triage }}"
                   REPOSITORY: "${{ github.repository }}"
@@ -134,7 +135,7 @@ jobs:
 
             - name: "Collect outputs"
               id: "collect_outputs"
-              uses: "actions/github-script@v8"
+              uses: "actions/github-script@v9"
               with:
                   script: |-
                       const fs = require('fs');

@@ -210,7 +210,7 @@ export async function checkoutToBranchForSession(
 /**
  * リポジトリを選択するヘルパー関数
  */
-async function selectRepository(
+export async function selectRepository(
     repositories: any[],
     log: (msg: string) => void
 ): Promise<any | null> {
@@ -239,7 +239,7 @@ async function selectRepository(
 /**
  * 未コミット変更のハンドリング
  */
-async function handleUncommittedChanges(
+export async function handleUncommittedChanges(
     repository: any,
     branchName: string,
     log: (msg: string) => void
@@ -354,18 +354,24 @@ async function performCheckout(
  * - Must have path matching /owner/repo/pull/number
  * - Canonical form is returned (without query strings or fragments)
  */
+// Cache for PR URL extraction (improves performance by avoiding repeated string parsing/regex)
+const prUrlCache = new WeakMap<Session, string>();
+
 export function getPullRequestUrlForSession(session: Session): string | null {
     try {
+        if (typeof session !== "object" || session === null) {
+            return null;
+        }
+
+        const cached = prUrlCache.get(session);
+        if (cached !== undefined) {
+            return cached;
+        }
+
         // Extract PR URL from outputs
         const raw = session.outputs?.find((o) => o.pullRequest)?.pullRequest?.url;
 
         if (!raw) {
-            return null;
-        }
-
-        // Validate: Must be a string
-        if (typeof raw !== "string") {
-            console.warn(`[Jules] PR URL type validation failed: expected string, got ${typeof raw}`);
             return null;
         }
 
@@ -409,6 +415,7 @@ export function getPullRequestUrlForSession(session: Session): string | null {
 
         // Return canonical form (normalized URL without query/fragment)
         const canonical = `https://github.com/${owner}/${repo}/pull/${numberStr}`;
+        prUrlCache.set(session, canonical);
         return canonical;
     } catch (error) {
         console.warn(`[Jules] Unexpected error extracting PR URL from session`);
@@ -548,17 +555,28 @@ async function fetchAndCheckoutFromPRInfo(
         // リポジトリのリモート一覧を取得
         const remotes: { remote: string; fetchUrl: string }[] = repository.state?.remotes || [];
 
-        // headCloneUrlに一致するリモートを探す
-        let targetRemote = remotes.find(
-            (r: { fetchUrl?: string; pushUrl?: string }) =>
-                r.fetchUrl === headCloneUrl || r.fetchUrl?.replace('.git', '') === headCloneUrl.replace('.git', '')
-        );
+        const headCloneUrlNoGit = headCloneUrl.endsWith('.git') ? headCloneUrl.slice(0, -4) : headCloneUrl;
+
+        // 必要なリモートだけを1回の走査で探す
+        let targetRemote: typeof remotes[number] | undefined;
+        let originRemote: typeof remotes[number] | undefined;
+
+        for (const r of remotes) {
+            if (!targetRemote && r.fetchUrl) {
+                if (r.fetchUrl === headCloneUrl || (r.fetchUrl.endsWith('.git') ? r.fetchUrl.slice(0, -4) : r.fetchUrl) === headCloneUrlNoGit) {
+                    targetRemote = r;
+                }
+            }
+            if (!originRemote && r.remote === 'origin') {
+                originRemote = r;
+            }
+            if (targetRemote && originRemote) {
+                break;
+            }
+        }
 
         // フォークからのPRで、対応するリモートがない場合
         if (!targetRemote) {
-            // origin/upstreamを確認
-            const originRemote = remotes.find((r: { remote: string }) => r.remote === 'origin');
-
             // originがheadCloneUrlと同じなら、originを使う
             if (originRemote?.fetchUrl?.includes(`${headOwner}/${headRepo}`)) {
                 targetRemote = originRemote;

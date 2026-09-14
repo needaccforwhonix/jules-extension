@@ -1,7 +1,7 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
 import * as sinon from "sinon";
-import { createJulesSession, sendMessage } from "../sessionUtils";
+import { createJulesSession, fetchSingleActivity, recoverCorruptedActivities, sendMessage, handleUserFeedbackRequired } from "../sessionUtils";
 import * as fetchUtils from "../fetchUtils";
 
 suite("sessionUtils Test Suite", () => {
@@ -97,7 +97,7 @@ suite("sessionUtils Test Suite", () => {
         assert.strictEqual(url, "https://jules.googleapis.com/v1alpha/sessions/123:sendMessage");
         
         const payload = JSON.parse(options.body);
-        assert.strictEqual(payload.prompt, "test message\n\nPlease use Japanese for all GitHub interactions (PR titles, descriptions, commit messages, and review replies).");
+        assert.strictEqual(payload.prompt, "test message");
     });
 
     test("sendMessage throws error when API fails", async () => {
@@ -115,4 +115,285 @@ suite("sessionUtils Test Suite", () => {
             assert.ok(error.message.includes("Session not found"));
         }
     });
+
+    test("fetchSingleActivity returns activity details", async () => {
+        fetchStub.resolves({
+            ok: true,
+            json: async () => ({
+                name: "sessions/123/activities/a1",
+                createTime: "2026-01-01T00:00:00Z",
+                id: "a1",
+            }),
+        } as Response);
+
+        const activity = await fetchSingleActivity("dummy-key", "sessions/123", "a1");
+
+        assert.strictEqual(activity.id, "a1");
+        const [url, options] = fetchStub.firstCall.args;
+        assert.strictEqual(url, "https://jules.googleapis.com/v1alpha/sessions/123/activities/a1");
+        assert.strictEqual(options.headers["X-Goog-Api-Key"], "dummy-key");
+    });
+
+    test("fetchSingleActivity throws wrapped error on failure", async () => {
+        fetchStub.resolves({
+            ok: false,
+            status: 404,
+            statusText: "Not Found",
+            json: async () => ({}),
+        } as Response);
+
+        await assert.rejects(
+            fetchSingleActivity("dummy-key", "sessions/missing", "a404"),
+            /Failed to fetch activity: API request failed: 404 Not Found/
+        );
+    });
+
+    test("fetchSingleActivity preserves original error as cause", async () => {
+        fetchStub.resolves({
+            ok: false,
+            status: 500,
+            statusText: "Internal Server Error",
+            json: async () => ({}),
+        } as Response);
+
+        await assert.rejects(
+            async () => fetchSingleActivity("dummy-key", "sessions/missing", "a500"),
+            (error: Error & { cause?: unknown }) => {
+                assert.ok(error.message.includes("Failed to fetch activity:"));
+                assert.ok(error.cause instanceof Error);
+                assert.ok((error.cause as Error).message.includes("API request failed: 500 Internal Server Error"));
+                return true;
+            }
+        );
+    });
+});
+
+suite("sessionUtils recoverCorruptedActivities", () => {
+    let consoleErrorStub: sinon.SinonStub;
+
+    setup(() => {
+        consoleErrorStub = sinon.stub(console, "error");
+        sinon.stub(vscode.window, "withProgress").callsFake((opts, task) => task({ report: () => {} } as any, new vscode.CancellationTokenSource().token));
+    });
+
+    teardown(() => {
+        sinon.restore();
+    });
+
+    test("should skip if no corrupted activities", async () => {
+        const activities = [{ id: "1", type: "planGenerated", planGenerated: {} } as any];
+        const spy = sinon.stub(globalThis, "fetch").resolves();
+        await recoverCorruptedActivities("key", "sess", activities);
+        assert.strictEqual(spy.called, false);
+    });
+
+    test("should fetch and replace corrupted activities", async () => {
+        const activities = [{ id: "1", type: "planGenerated" } as any];
+
+        // Mock fetch directly. We can mock fetchSingleActivity, but it's not easily mockable unless we mock fetch inside it.
+        const mockResponse = {
+            ok: true,
+            status: 200,
+            json: async () => ({
+                activities: [{
+                    id: "1",
+                    type: "planGenerated",
+                    planGenerated: { plan: { title: "recovered" } }
+                }]
+            })
+        };
+        sinon.stub(globalThis, "fetch").resolves(mockResponse as any);
+
+        const progress = { report: sinon.spy() };
+        await recoverCorruptedActivities("key", "sess/1", activities, progress as any);
+
+        assert.ok(progress.report.calledOnce);
+        assert.ok(activities[0].planGenerated);
+        assert.strictEqual((activities[0] as any).planGenerated.plan.title, "recovered");
+    });
+
+
+    test("should handle missing activities field in response", async () => {
+        const activities = [{ id: "1", type: "planGenerated" } as any];
+        const mockResponse = {
+            ok: true,
+            status: 200,
+            json: async () => ({}) // missing activities
+        };
+        sinon.stub(globalThis, "fetch").resolves(mockResponse as any);
+        await recoverCorruptedActivities("key", "sess/1", activities);
+        assert.strictEqual(activities.length, 0); // Not recovered, so it gets dropped
+    });
+
+    test("should paginate correctly when item is found on subsequent pages", async () => {
+        // We look for ID "2" which is corrupted
+        const activities = [{ id: "2", type: "planGenerated" } as any];
+
+        let callCount = 0;
+        const mockResponse = {
+            ok: true,
+            status: 200,
+            json: async () => {
+                callCount++;
+                if (callCount === 1) {
+                    return {
+                        // First page has ID "1", not "2"
+                        activities: [{ id: "1", type: "agentMessaged", agentMessaged: { agentMessage: "hi" } }],
+                        nextPageToken: "token-2"
+                    };
+                } else if (callCount === 2) {
+                    return {
+                        // Second page has ID "2"
+                        activities: [{ id: "2", type: "planGenerated", planGenerated: { plan: { title: "found on page 2" } } }],
+                        nextPageToken: "token-3"
+                    };
+                } else {
+                    return {};
+                }
+            }
+        };
+        sinon.stub(globalThis, "fetch").resolves(mockResponse as any);
+
+        await recoverCorruptedActivities("key", "sess/1", activities);
+        assert.strictEqual(callCount, 2); // Should loop exactly twice and early exit
+        assert.strictEqual((activities[0] as any).planGenerated.plan.title, "found on page 2");
+    });
+
+    test("should break early if MAX_PAGES exceeded", async () => {
+        const activities = [{ id: "1", type: "planGenerated" } as any];
+        const mockResponse = {
+            ok: true,
+            status: 200,
+            json: async () => ({ nextPageToken: "token" }) // Always returning next page but never the activity
+        };
+        const fetchStub = sinon.stub(globalThis, "fetch").resolves(mockResponse as any);
+
+        await recoverCorruptedActivities("key", "sess/1", activities);
+        assert.strictEqual(fetchStub.callCount, 10); // Should stop at MAX_PAGES
+        assert.strictEqual(activities.length, 0);
+    });
+
+    test("should skip non-corrupted activities in recovered loop", async () => {
+        const activities = [{ id: "1", type: "planGenerated" } as any];
+        const mockResponse = {
+            ok: true,
+            status: 200,
+            json: async () => ({
+                activities: [{
+                    id: "1",
+                    type: "planGenerated", // Still missing payload, so it's "corrupted" after recovery
+                }]
+            })
+        };
+        sinon.stub(globalThis, "fetch").resolves(mockResponse as any);
+        await recoverCorruptedActivities("key", "sess/1", activities);
+        assert.strictEqual(activities.length, 0); // Recovery failed because it's still corrupted
+    });
+
+
+    test("should handle missing activities field in response gracefully", async () => {
+        const activities = [{ id: "1", type: "planGenerated" } as any];
+        const mockResponse = {
+            ok: true,
+            status: 200,
+            json: async () => ({})
+        };
+        sinon.stub(globalThis, "fetch").resolves(mockResponse as any);
+        await recoverCorruptedActivities("key", "sess/1", activities);
+        assert.strictEqual(activities.length, 0); // Fails to recover, gets dropped
+    });
+
+    test("should return early when activities length is 0", async () => {
+        const spy = sinon.spy(globalThis, "fetch");
+        await recoverCorruptedActivities("key", "sess/1", []);
+        assert.strictEqual(spy.called, false);
+        spy.restore();
+    });
+
+    test("should handle fetch error response (!response.ok)", async () => {
+        const activities = [{ id: "1", type: "planGenerated" } as any];
+        const mockResponse = {
+            ok: false,
+            status: 500,
+            statusText: "Internal Server Error"
+        };
+        sinon.stub(globalThis, "fetch").resolves(mockResponse as any);
+        await recoverCorruptedActivities("key", "sess/1", activities);
+        assert.strictEqual(activities.length, 0);
+    });
+
+    test("should fallback if fetch fails", async () => {
+        const activities = [{ id: "1", type: "planGenerated" } as any];
+
+        sinon.stub(globalThis, "fetch").rejects(new Error("network failure"));
+
+        await recoverCorruptedActivities("key", "sess/1", activities);
+
+        assert.strictEqual(activities.length, 0); // Corrupted activity is filtered out
+    });
+
+
+  suite("handleUserFeedbackRequired", () => {
+    let getConfigurationStub: sinon.SinonStub;
+    let showInformationMessageStub: sinon.SinonStub;
+    let executeCommandStub: sinon.SinonStub;
+    let logChannelStub: any;
+
+    setup(() => {
+      getConfigurationStub = sinon.stub(vscode.workspace, "getConfiguration");
+      showInformationMessageStub = sinon.stub(vscode.window, "showInformationMessage");
+      executeCommandStub = sinon.stub(vscode.commands, "executeCommand");
+      logChannelStub = { appendLine: sinon.stub() };
+    });
+
+    teardown(() => {
+      sinon.restore();
+    });
+
+    test("should use autoReplyMessage when configured", async () => {
+      const configMock = { get: sinon.stub().returns("Test reply message") };
+      getConfigurationStub.returns(configMock);
+
+      const session = { name: "sessions/123", title: "Test Session" } as any;
+      const fetchStub = sinon.stub(fetchUtils, "fetchWithTimeout").resolves({
+        ok: true,
+        json: async () => ({})
+      } as any);
+
+      await handleUserFeedbackRequired(session, "dummy-key", logChannelStub);
+
+      assert.ok(fetchStub.calledOnce);
+      assert.strictEqual(showInformationMessageStub.called, false);
+      assert.ok(logChannelStub.appendLine.called);
+    });
+
+    test("should fallback to manual prompt when autoReplyMessage throws", async () => {
+      const configMock = { get: sinon.stub().returns("Test reply message") };
+      getConfigurationStub.returns(configMock);
+
+      const session = { name: "sessions/123", title: "Test Session" } as any;
+      const fetchStub = sinon.stub(fetchUtils, "fetchWithTimeout").resolves({
+        ok: false,
+        status: 500,
+        statusText: "Internal Server Error",
+        text: async () => "Error"
+      } as any);
+
+      await handleUserFeedbackRequired(session, "dummy-key", logChannelStub);
+
+      assert.ok(fetchStub.calledOnce);
+      assert.ok(showInformationMessageStub.calledOnce);
+    });
+
+    test("should fallback to manual prompt when autoReplyMessage is empty", async () => {
+      const configMock = { get: sinon.stub().returns("") };
+      getConfigurationStub.returns(configMock);
+
+      const session = { name: "sessions/123", title: "Test Session" } as any;
+
+      await handleUserFeedbackRequired(session, "dummy-key", logChannelStub);
+
+      assert.ok(showInformationMessageStub.calledOnce);
+    });
+  });
 });

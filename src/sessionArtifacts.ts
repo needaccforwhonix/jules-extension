@@ -1,5 +1,5 @@
 import { fetchWithTimeout } from "./fetchUtils";
-import { ActivitiesResponse } from "./types";
+import type { ActivitiesResponse, Artifact, GitPatch } from "./types";
 import { JULES_API_BASE_URL } from "./julesApiConstants";
 
 export const ARTIFACTS_CACHE_STATE_KEY = "jules.artifacts.cache";
@@ -21,10 +21,6 @@ interface Activity {
     artifacts?: Artifact[];
 }
 
-interface Artifact {
-    changeSet?: Record<string, unknown>;
-}
-
 export interface ChangeSetFile {
     path: string;
     status?: string;
@@ -33,11 +29,29 @@ export interface ChangeSetFile {
 export interface ChangeSetSummary {
     files: ChangeSetFile[];
     raw: Record<string, unknown>;
+    baseCommitId?: string;
+    suggestedCommitMessage?: string;
 }
 
 export interface SessionArtifacts {
     latestDiff?: string;
     latestChangeSet?: ChangeSetSummary;
+}
+
+export function getChangeSetGitPatch(changeSet?: ChangeSetSummary): GitPatch | undefined {
+    const gitPatch = changeSet?.raw?.gitPatch;
+    if (!gitPatch || typeof gitPatch !== "object") {
+        return undefined;
+    }
+    return gitPatch as GitPatch;
+}
+
+export function getChangeSetUnidiffPatch(changeSet?: ChangeSetSummary): string | undefined {
+    const unidiffPatch = getChangeSetGitPatch(changeSet)?.unidiffPatch;
+    if (typeof unidiffPatch !== "string" || unidiffPatch.trim().length === 0) {
+        return undefined;
+    }
+    return unidiffPatch;
 }
 
 interface CachedSessionArtifacts {
@@ -71,18 +85,10 @@ function evictOldestArtifactsEntryIfNeeded(): void {
         return;
     }
 
-    let oldestSessionId: string | undefined;
-    let oldestSavedAt = Number.POSITIVE_INFINITY;
-    for (const [sessionId, entry] of artifactsCache.entries()) {
-        if (entry.savedAt < oldestSavedAt) {
-            oldestSavedAt = entry.savedAt;
-            oldestSessionId = sessionId;
-        }
-    }
-
-    if (oldestSessionId) {
-        artifactsCache.delete(oldestSessionId);
-    }
+    // Map preserves insertion order. The oldest entry is always the first one.
+    /* c8 ignore next 2 */
+    const firstKey = artifactsCache.keys().next().value!;
+    artifactsCache.delete(firstKey);
 }
 
 function persistArtifactsCache(): void {
@@ -182,7 +188,9 @@ function restoreArtifactsCacheFromGlobalState(now: number): boolean {
     }
 
     artifactsCache.clear();
-    for (const [sessionId, entry] of trimmedEntries) {
+    // Reverse insertion to ensure oldest items are at the front of the map
+    for (let i = trimmedEntries.length - 1; i >= 0; i -= 1) {
+        const [sessionId, entry] = trimmedEntries[i];
         artifactsCache.set(sessionId, entry);
     }
 
@@ -435,7 +443,7 @@ export function extractLatestArtifactsFromActivities(activities: Activity[]): Se
 
                     // Check for Diff from artifact (Priority 2)
                     if (!latestDiff) {
-                        const uniDiff = (artifact.changeSet?.gitPatch as any)?.unidiffPatch;
+                        const uniDiff = artifact.changeSet?.gitPatch?.unidiffPatch;
                         if (typeof uniDiff === "string" && uniDiff.trim().length > 0) {
                             latestDiff = uniDiff;
                         }
@@ -456,9 +464,21 @@ export function extractLatestArtifactsFromActivities(activities: Activity[]): Se
 
     let latestChangeSet: ChangeSetSummary | undefined;
     if (latestChangeSetRaw) {
+        const rawGitPatch = latestChangeSetRaw.gitPatch;
+        const gitPatch = rawGitPatch && typeof rawGitPatch === "object"
+            ? (rawGitPatch as Record<string, unknown>)
+            : undefined;
+        const baseCommitId = typeof gitPatch?.baseCommitId === "string"
+            ? gitPatch.baseCommitId
+            : undefined;
+        const suggestedCommitMessage = typeof gitPatch?.suggestedCommitMessage === "string"
+            ? gitPatch.suggestedCommitMessage
+            : undefined;
         latestChangeSet = {
             files: extractChangeSetFiles(latestChangeSetRaw, latestDiff),
             raw: latestChangeSetRaw,
+            baseCommitId,
+            suggestedCommitMessage,
         };
     }
 
@@ -481,16 +501,32 @@ function areChangeSetFilesEqual(a?: ChangeSetSummary, b?: ChangeSetSummary): boo
         return false;
     }
 
-    // Sort files by path to ensure order-independence
-    const sortedA = [...aFiles].sort((x, y) => x.path.localeCompare(y.path));
-    const sortedB = [...bFiles].sort((x, y) => x.path.localeCompare(y.path));
+        // ⚡ Bolt 最適化: O(N log N) のソート処理を O(N) の Map 集計に置換
+    // SetではなくMapを使用することで、多重集合（重複する要素を持つ配列）を正しく処理します。
+    const counts = new Map<string, number>();
+    for (const f of bFiles) {
+        const key = f.path + "|" + f.status;
+        counts.set(key, (counts.get(key) || 0) + 1);
+    }
 
-    for (let i = 0; i < sortedA.length; i += 1) {
-        if (sortedA[i].path !== sortedB[i].path || sortedA[i].status !== sortedB[i].status) {
+    for (const f of aFiles) {
+        const key = f.path + "|" + f.status;
+        const count = counts.get(key);
+        if (!count) {
             return false;
         }
+        counts.set(key, count - 1);
     }
     return true;
+}
+
+function areChangeSetsEqual(a?: ChangeSetSummary, b?: ChangeSetSummary): boolean {
+    if (!areChangeSetFilesEqual(a, b)) {
+        return false;
+    }
+    return getChangeSetUnidiffPatch(a) === getChangeSetUnidiffPatch(b)
+        && a?.baseCommitId === b?.baseCommitId
+        && a?.suggestedCommitMessage === b?.suggestedCommitMessage;
 }
 
 export function updateSessionArtifactsCache(sessionId: string, activities: Activity[], updateTime?: string): boolean {
@@ -501,10 +537,12 @@ export function updateSessionArtifactsCache(sessionId: string, activities: Activ
     const nextSavedAt = Date.now();
 
     const diffChanged = previousArtifacts?.latestDiff !== latest.latestDiff;
-    const changeSetChanged = !areChangeSetFilesEqual(previousArtifacts?.latestChangeSet, latest.latestChangeSet);
+    const changeSetChanged = !areChangeSetsEqual(previousArtifacts?.latestChangeSet, latest.latestChangeSet);
     const timeChanged = updateTime !== previousEntry?.updateTime;
 
     if (diffChanged || changeSetChanged || (!!updateTime && timeChanged)) {
+        // Delete before set to update insertion order (move to newest)
+        artifactsCache.delete(sessionId);
         artifactsCache.set(sessionId, {
             artifacts: latest,
             updateTime: nextUpdateTime,

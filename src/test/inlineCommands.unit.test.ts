@@ -70,6 +70,23 @@ suite("inlineCommands Test Suite", () => {
         assert.ok(prompt.includes(`\n${fence}\n`));
     });
 
+    test("JulesCodeLensProvider returns no lenses and skips symbol lookup when disabled", async () => {
+        sandbox.stub(vscode.workspace, "getConfiguration").returns({
+            get: () => false,
+        } as any);
+        const executeStub = sandbox.stub(vscode.commands, "executeCommand");
+
+        const provider = new JulesCodeLensProvider({ appendLine: sandbox.stub() } as any);
+        const lenses = await provider.provideCodeLenses(
+            { uri: vscode.Uri.parse("file:///sample.ts") } as any,
+            { isCancellationRequested: false } as any,
+        );
+
+        assert.deepStrictEqual(lenses, []);
+        assert.strictEqual(executeStub.called, false);
+        provider.dispose();
+    });
+
     test("JulesCodeLensProvider returns lenses for nested symbols", async () => {
         const configStub = sandbox.stub(vscode.workspace, "getConfiguration").returns({
             get: () => true,
@@ -123,6 +140,29 @@ suite("inlineCommands Test Suite", () => {
         assert.strictEqual(appendLine.calledOnce, true);
     });
 
+    test("handleInlineTask logs and reports when the target document cannot be opened", async () => {
+        const showErrorStub = sandbox.stub(vscode.window, "showErrorMessage");
+        sandbox.stub(vscode.workspace, "openTextDocument").rejects(new Error("missing file\nsecret"));
+        const appendLine = sandbox.stub();
+
+        await handleInlineTask(
+            {
+                globalState: { get: sandbox.stub() },
+                secrets: { get: sandbox.stub() },
+            } as any,
+            { appendLine } as any,
+            vscode.Uri.parse("file:///workspace/missing.ts"),
+            new vscode.Range(0, 0, 0, 10),
+            "Refactor",
+        );
+
+        assert.strictEqual(showErrorStub.calledOnce, true);
+        assert.strictEqual(showErrorStub.firstCall.args[0], "Could not open the target document.");
+        assert.strictEqual(appendLine.calledOnce, true);
+        assert.match(String(appendLine.firstCall.args[0]), /Error opening document/);
+        assert.match(String(appendLine.firstCall.args[0]), /missing file\\nsecret/);
+    });
+
     test("handleInlineTask shows an error when the file is outside the workspace", async () => {
         const showErrorStub = sandbox.stub(vscode.window, "showErrorMessage");
         sandbox.stub(vscode.workspace, "openTextDocument").resolves({
@@ -144,6 +184,34 @@ suite("inlineCommands Test Suite", () => {
         );
 
         assert.strictEqual(showErrorStub.calledOnce, true);
+    });
+
+    test("handleInlineTask stops before branch loading when the API key is missing", async () => {
+        const showErrorStub = sandbox.stub(vscode.window, "showErrorMessage");
+        sandbox.stub(vscode.workspace, "openTextDocument").resolves({
+            getText: () => "const value = 1",
+            uri: vscode.Uri.parse("file:///workspace/file.ts"),
+            languageId: "typescript",
+        } as any);
+        (vscode.workspace as any).getWorkspaceFolder = sandbox.stub().returns({ uri: vscode.Uri.parse("file:///workspace") });
+        const branchStub = sandbox.stub(branchUtils, "getBranchesForSession");
+
+        await handleInlineTask(
+            {
+                globalState: {
+                    get: sandbox.stub().returns({ id: "source-1", name: "repo" }),
+                },
+                secrets: { get: sandbox.stub().resolves(undefined) },
+            } as any,
+            { appendLine: sandbox.stub() } as any,
+            vscode.Uri.parse("file:///workspace/file.ts"),
+            new vscode.Range(0, 0, 0, 10),
+            "Refactor",
+        );
+
+        assert.strictEqual(showErrorStub.calledOnce, true);
+        assert.match(showErrorStub.firstCall.args[0], /API Key not found/);
+        assert.strictEqual(branchStub.called, false);
     });
 
     test("handleInlineTask stops when no specific source is selected", async () => {
@@ -169,6 +237,39 @@ suite("inlineCommands Test Suite", () => {
         );
 
         assert.strictEqual(showErrorStub.calledOnce, true);
+    });
+
+    test("handleInlineTask stops when branch selection is cancelled", async () => {
+        const showWarningStub = sandbox.stub(vscode.window, "showWarningMessage");
+        sandbox.stub(vscode.workspace, "openTextDocument").resolves({
+            getText: () => "const value = 1",
+            uri: vscode.Uri.parse("file:///workspace/file.ts"),
+            languageId: "typescript",
+        } as any);
+        (vscode.workspace as any).getWorkspaceFolder = sandbox.stub().returns({ uri: vscode.Uri.parse("file:///workspace") });
+        sandbox.stub(branchUtils, "getBranchesForSession").resolves({
+            branches: ["main"],
+            defaultBranch: "main",
+            currentBranch: "main",
+            remoteBranches: ["main"],
+        } as any);
+        sandbox.stub(vscode.window, "showQuickPick").resolves(undefined);
+        const composerStub = sandbox.stub(composer, "showMessageComposer");
+
+        await handleInlineTask(
+            {
+                globalState: { get: sandbox.stub().returns({ id: "source-1", name: "repo" }) },
+                secrets: { get: sandbox.stub().resolves("api-key") },
+            } as any,
+            { appendLine: sandbox.stub() } as any,
+            vscode.Uri.parse("file:///workspace/file.ts"),
+            new vscode.Range(0, 0, 0, 10),
+            "Generate Tests",
+        );
+
+        assert.strictEqual(showWarningStub.calledOnce, true);
+        assert.strictEqual(showWarningStub.firstCall.args[0], "Branch selection was cancelled or invalid.");
+        assert.strictEqual(composerStub.called, false);
     });
 
     test("handleInlineTask creates a session when all inputs are valid", async () => {
