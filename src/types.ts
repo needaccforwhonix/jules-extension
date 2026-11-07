@@ -68,7 +68,7 @@ export interface Session {
     requirePlanApproval?: boolean;
     createTime?: string;  // ISO 8601 timestamp
     updateTime?: string;  // ISO 8601 timestamp
-    automationMode?: "AUTO_CREATE_PR" | "MANUAL" | "AUTOMATION_MODE_UNSPECIFIED";
+    automationMode?: "AUTO_CREATE_PR" | "MANUAL" | "AUTOMATION_MODE_MANUAL" | "AUTOMATION_MODE_UNSPECIFIED";
 }
 
 // Convenience type alias
@@ -94,6 +94,7 @@ export interface Artifact {
 }
 /* c8 ignore stop */
 
+/* c8 ignore start */
 export interface Activity {
     name: string;
     createTime: string;
